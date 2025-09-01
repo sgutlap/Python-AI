@@ -1,3 +1,4 @@
+from email.mime import message
 import wave, struct, os
 from pvrecorder import PvRecorder
 from playsound import playsound
@@ -6,6 +7,8 @@ import google.generativeai as genai
 from gtts import gTTS
 import warnings
 import speech_recognition as sr
+import threading
+
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -37,11 +40,16 @@ class Chatbot:
         self.speak(reply)
 
     def speak(self, message, index=0):
+        def play_audio(path):
+            playsound(path)
+            os.remove(path)
+
         speech_file_path = os.path.join(os.getcwd(), f"speech_{index}.mp3")
         tts = gTTS(text=message, lang="en")
         tts.save(speech_file_path)
-        playsound(speech_file_path)
-    
+
+        threading.Thread(target=play_audio, args=(speech_file_path,), daemon=True).start()
+        
     def record_audio(self, index=0):
         recorder = PvRecorder(device_index=-1, frame_length=512)
         audio = []
