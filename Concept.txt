@@ -1,0 +1,555 @@
+# Advanced_Video_Analysis.py
+import os
+import cv2
+import numpy as np
+import tempfile
+import json
+from datetime import datetime
+import google.generativeai as genai
+from google.api_core import retry
+import speech_recognition as sr
+import subprocess
+import logging
+import threading
+import queue
+import time
+from enum import Enum
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configure API (use environment variables in production)
+API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here")
+genai.configure(api_key=API_KEY)
+
+# Use a more capable model
+model = genai.GenerativeModel("gemini-1.5-pro")
+
+class AnalysisMode(Enum):
+    VIDEO_FILE = 1
+    LIVE_FEED = 2
+    USER_QUERY = 3
+
+class AdvancedVideoAnalyzer:
+    def __init__(self):
+        self.model = genai.GenerativeModel("gemini-1.5-pro")
+        self.recognizer = sr.Recognizer()
+        self.frame_queue = queue.Queue(maxsize=100)
+        self.is_processing = False
+        self.current_context = ""
+        
+    def extract_audio(self, video_path, output_audio="temp_audio.wav"):
+        """Extracts audio from video using ffmpeg with proper error handling."""
+        try:
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+                
+            abs_video_path = os.path.abspath(video_path)
+            abs_output_audio = os.path.abspath(output_audio)
+            
+            cmd = [
+                'ffmpeg', '-y', '-i', abs_video_path, 
+                '-vn', '-acodec', 'pcm_s16le', 
+                '-ar', '44100', '-ac', '2', 
+                abs_output_audio
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                raise RuntimeError(f"Audio extraction failed: {result.stderr}")
+            
+            if os.path.exists(output_audio):
+                logger.info(f"Audio extracted successfully to {output_audio}")
+                return output_audio
+            else:
+                raise RuntimeError("Audio extraction failed - output file not created")
+                
+        except subprocess.TimeoutExpired:
+            logger.error("Audio extraction timed out")
+            raise RuntimeError("Audio extraction took too long")
+        except Exception as e:
+            logger.error(f"Error in audio extraction: {str(e)}")
+            raise
+
+    def transcribe_audio(self, audio_path):
+        """Transcribes audio using Google Speech Recognition."""
+        try:
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            
+            with sr.AudioFile(audio_path) as source:
+                audio_data = self.recognizer.record(source)
+                
+            transcription = self.recognizer.recognize_google(audio_data)
+            logger.info("Audio transcription completed successfully")
+            return transcription
+            
+        except sr.UnknownValueError:
+            logger.warning("Google Speech Recognition could not understand the audio")
+            return "Audio could not be transcribed clearly"
+        except sr.RequestError as e:
+            logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+            return "Audio transcription service unavailable"
+        except Exception as e:
+            logger.error(f"Error in audio transcription: {str(e)}")
+            return f"Audio transcription error: {str(e)}"
+
+    def extract_key_frames(self, video_path, sample_rate=30, max_frames=20):
+        """Extracts and analyzes key frames from video with more meaningful information."""
+        key_frames_info = []
+        
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError("Could not open video file")
+                
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            duration = frame_count / fps if fps > 0 else 0
+            
+            logger.info(f"Video details: {frame_count} frames, {fps:.2f} FPS, {duration:.2f} seconds")
+            
+            # Adjust sample rate based on video length
+            if frame_count > 900:  # Longer than 30 seconds at 30fps
+                sample_rate = max(15, sample_rate)
+            
+            # Process frames
+            frames_processed = 0
+            for i in range(0, frame_count, sample_rate):
+                if frames_processed >= max_frames:
+                    break
+                    
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ret, frame = cap.read()
+                
+                if ret:
+                    # Convert frame to RGB (OpenCV uses BGR)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Calculate basic image properties
+                    height, width, channels = frame.shape
+                    avg_color = np.mean(frame_rgb, axis=(0, 1))
+                    brightness = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                    
+                    # Detect edges to estimate visual complexity
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 100, 200)
+                    edge_density = np.mean(edges) / 255.0
+                    
+                    # Detect faces (simple example)
+                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                    
+                    # Detect motion (compared to previous frame)
+                    motion_level = 0
+                    if i > sample_rate:
+                        prev_frame = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if 'prev_frame' in locals() else gray
+                        frame_diff = cv2.absdiff(prev_frame, gray)
+                        motion_level = np.mean(frame_diff) / 255.0
+                    
+                    prev_frame = frame.copy()
+                    
+                    # Save frame information
+                    frame_info = {
+                        "frame_number": i,
+                        "timestamp": i / fps if fps > 0 else 0,
+                        "dimensions": f"{width}x{height}",
+                        "avg_color": avg_color.tolist(),
+                        "brightness": float(brightness),
+                        "edge_density": float(edge_density),
+                        "face_count": len(faces),
+                        "motion_level": float(motion_level)
+                    }
+                    
+                    key_frames_info.append(frame_info)
+                    frames_processed += 1
+            
+            cap.release()
+            logger.info(f"Extracted {len(key_frames_info)} key frames for analysis")
+            return key_frames_info, duration
+            
+        except Exception as e:
+            logger.error(f"Error in frame extraction: {str(e)}")
+            if 'cap' in locals():
+                cap.release()
+            raise
+
+    def analyze_with_gemini(self, transcription, frame_analysis, video_duration, description, user_query=None):
+        """Sends analysis request to Gemini API with proper formatting and error handling."""
+        try:
+            # Format frame analysis into a readable summary
+            frame_summary = "Visual Analysis:\n"
+            for i, frame in enumerate(frame_analysis):
+                frame_summary += (
+                    f"Frame {i+1} (at {frame['timestamp']:.1f}s): "
+                    f"{frame['dimensions']}, "
+                    f"brightness: {frame['brightness']:.1f}, "
+                    f"edge density: {frame['edge_density']:.2f}, "
+                    f"faces detected: {frame['face_count']}, "
+                    f"motion level: {frame['motion_level']:.2f}\n"
+                )
+            
+            # Prepare a comprehensive prompt
+            prompt = f"""
+            Video Analysis Request:
+            
+            Description: {description}
+            Video Duration: {video_duration:.2f} seconds
+            """
+            
+            if user_query:
+                prompt += f"User Query: {user_query}\n"
+            
+            prompt += f"""
+            Audio Transcript: {transcription}
+            
+            {frame_summary}
+            
+            Please provide a detailed analysis of the video content including:
+            1. Main subjects and activities in the video
+            2. Overall mood or tone based on visual and audio cues
+            3. Key events or transitions
+            4. Technical quality assessment (lighting, clarity, etc.)
+            5. Potential content categorization
+            6. Answer any specific user questions
+            
+            Provide your response in a structured format with clear sections.
+            """
+            
+            # Generate content with retry mechanism
+            response = self.model.generate_content(prompt)
+            
+            if response and hasattr(response, 'text'):
+                logger.info("Successfully received analysis from Gemini")
+                self.current_context = response.text
+                return response.text
+            else:
+                raise ValueError("Empty or invalid response from Gemini API")
+                
+        except Exception as e:
+            logger.error(f"Error in Gemini analysis: {str(e)}")
+            return f"Analysis failed: {str(e)}"
+
+    def process_live_feed(self, camera_index=0, duration=30, analysis_interval=5):
+        """Process live video feed from a camera."""
+        self.is_processing = True
+        cap = cv2.VideoCapture(camera_index)
+        
+        if not cap.isOpened():
+            logger.error("Cannot open camera")
+            self.is_processing = False
+            return
+        
+        start_time = time.time()
+        last_analysis_time = start_time
+        frame_buffer = []
+        analysis_results = []
+        
+        print("Starting live video analysis. Press 'q' to stop.")
+        
+        while self.is_processing and (time.time() - start_time) < duration:
+            ret, frame = cap.read()
+            
+            if not ret:
+                logger.error("Can't receive frame. Exiting...")
+                break
+                
+            # Display the frame
+            cv2.imshow('Live Video Analysis', frame)
+            
+            # Store frame for analysis
+            if len(frame_buffer) < 100:  # Limit buffer size
+                frame_buffer.append(frame)
+            
+            # Analyze at intervals
+            current_time = time.time()
+            if current_time - last_analysis_time >= analysis_interval:
+                # Analyze recent frames
+                if frame_buffer:
+                    analysis_result = self.analyze_frames(frame_buffer)
+                    analysis_results.append({
+                        "timestamp": current_time - start_time,
+                        "analysis": analysis_result
+                    })
+                    print(f"Analysis at {current_time - start_time:.1f}s: {analysis_result[:100]}...")
+                
+                last_analysis_time = current_time
+                frame_buffer = []  # Clear buffer after analysis
+            
+            # Check for quit command
+            if cv2.waitKey(1) == ord('q'):
+                break
+        
+        cap.release()
+        cv2.destroyAllWindows()
+        self.is_processing = False
+        
+        # Generate final summary
+        final_analysis = self.generate_live_summary(analysis_results)
+        return final_analysis
+
+    def analyze_frames(self, frames):
+        """Analyze a set of frames for live processing."""
+        try:
+            # Convert frames to a format suitable for analysis
+            frame_analysis = []
+            for i, frame in enumerate(frames):
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Basic analysis
+                brightness = np.mean(gray)
+                edges = cv2.Canny(gray, 100, 200)
+                edge_density = np.mean(edges) / 255.0
+                
+                # Motion detection (if we have previous frames)
+                motion_level = 0
+                if i > 0:
+                    prev_gray = cv2.cvtColor(frames[i-1], cv2.COLOR_BGR2GRAY)
+                    frame_diff = cv2.absdiff(prev_gray, gray)
+                    motion_level = np.mean(frame_diff) / 255.0
+                
+                frame_analysis.append({
+                    "brightness": float(brightness),
+                    "edge_density": float(edge_density),
+                    "motion_level": float(motion_level)
+                })
+            
+            # Prepare prompt for Gemini
+            prompt = f"""
+            Analyze these video frames from a live feed. The frames represent a short segment of video.
+            
+            Frame analysis:
+            - Average brightness: {np.mean([f['brightness'] for f in frame_analysis]):.1f}
+            - Average edge density: {np.mean([f['edge_density'] for f in frame_analysis]):.2f}
+            - Average motion level: {np.mean([f['motion_level'] for f in frame_analysis]):.2f}
+            
+            Describe what is happening in this video segment. Focus on:
+            1. Main activities or events
+            2. Number of people (if any)
+            3. Environment/setting
+            4. Any notable changes or movements
+            
+            Keep your response concise but informative.
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text if response and hasattr(response, 'text') else "Analysis unavailable"
+            
+        except Exception as e:
+            logger.error(f"Error in frame analysis: {str(e)}")
+            return f"Analysis error: {str(e)}"
+
+    def generate_live_summary(self, analysis_results):
+        """Generate a summary of live analysis results."""
+        try:
+            prompt = "Summarize the following live video analysis results:\n\n"
+            
+            for i, result in enumerate(analysis_results):
+                prompt += f"Time {result['timestamp']:.1f}s: {result['analysis']}\n"
+            
+            prompt += """
+            Please provide a comprehensive summary of what happened throughout the video:
+            1. Chronological sequence of events
+            2. Overall activity description
+            3. Notable changes or patterns over time
+            4. Any significant observations
+            
+            Structure your response with clear sections.
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text if response and hasattr(response, 'text') else "Summary unavailable"
+            
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            return f"Summary error: {str(e)}"
+
+    def ask_question_about_video(self, question, video_context):
+        """Ask a question about a previously analyzed video."""
+        try:
+            prompt = f"""
+            Based on the following video analysis context, answer the user's question.
+            
+            Video Context:
+            {video_context}
+            
+            User Question: {question}
+            
+            Please provide a detailed answer based on the video analysis. If the question cannot be answered
+            from the available context, clearly state what information is missing.
+            """
+            
+            response = self.model.generate_content(prompt)
+            return response.text if response and hasattr(response, 'text') else "No response generated"
+            
+        except Exception as e:
+            logger.error(f"Error answering question: {str(e)}")
+            return f"Error: {str(e)}"
+
+    def analyze_video_content(self, video_path, description="Analyze the video content and audio", user_query=None):
+        """Main function to analyze video content with enhanced features."""
+        start_time = datetime.now()
+        logger.info(f"Starting analysis of {video_path}")
+        
+        # Validate input
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+        
+        # Create temporary directory for intermediate files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = os.path.join(temp_dir, "extracted_audio.wav")
+            
+            try:
+                # Step 1: Extract audio
+                audio_file = self.extract_audio(video_path, audio_path)
+                
+                # Step 2: Transcribe audio
+                transcription = self.transcribe_audio(audio_file)
+                
+                # Step 3: Analyze video frames
+                frame_analysis, video_duration = self.extract_key_frames(video_path)
+                
+                # Step 4: Send to Gemini for analysis
+                analysis_result = self.analyze_with_gemini(
+                    transcription, frame_analysis, video_duration, description, user_query
+                )
+                
+                # Calculate processing time
+                processing_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"Analysis completed in {processing_time:.2f} seconds")
+                
+                # Return comprehensive results
+                return {
+                    "analysis": analysis_result,
+                    "transcription": transcription,
+                    "processing_time": processing_time,
+                    "video_duration": video_duration,
+                    "frames_analyzed": len(frame_analysis),
+                    "context": analysis_result  # Store for future questions
+                }
+                
+            except Exception as e:
+                logger.error(f"Video analysis failed: {str(e)}")
+                raise
+
+    def save_analysis_results(self, results, output_file="video_analysis_report.txt"):
+        """Saves the analysis results to a file."""
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write("VIDEO ANALYSIS REPORT\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Processing time: {results.get('processing_time', 0):.2f} seconds\n")
+                f.write(f"Video duration: {results.get('video_duration', 0):.2f} seconds\n")
+                f.write(f"Frames analyzed: {results.get('frames_analyzed', 0)}\n\n")
+                
+                f.write("TRANSCRIPTION:\n")
+                f.write("-" * 20 + "\n")
+                f.write(results.get('transcription', 'No transcription available') + "\n\n")
+                
+                f.write("ANALYSIS:\n")
+                f.write("-" * 20 + "\n")
+                f.write(results.get('analysis', 'No analysis available') + "\n")
+            
+            logger.info(f"Analysis report saved to {output_file}")
+            return output_file
+            
+        except Exception as e:
+            logger.error(f"Failed to save results: {str(e)}")
+            return None
+
+# --- Interactive main function ---
+def main():
+    analyzer = AdvancedVideoAnalyzer()
+    current_context = None
+    
+    while True:
+        print("\n=== ADVANCED VIDEO ANALYSIS SYSTEM ===")
+        print("1. Analyze a video file")
+        print("2. Process live camera feed")
+        print("3. Ask question about analyzed video")
+        print("4. Exit")
+        
+        choice = input("\nPlease choose an option (1-4): ").strip()
+        
+        if choice == "1":
+            # Analyze video file
+            video_path = input("Enter the path to the video file: ").strip()
+            description = input("Enter a description or purpose for analysis (optional): ").strip()
+            user_query = input("Enter any specific questions about the video (optional): ").strip()
+            
+            if not description:
+                description = "Analyze the video content and audio"
+            
+            try:
+                results = analyzer.analyze_video_content(video_path, description, user_query if user_query else None)
+                current_context = results["context"]
+                
+                print("\n=== ANALYSIS RESULTS ===")
+                print(f"Video duration: {results['video_duration']:.2f} seconds")
+                print(f"Processing time: {results['processing_time']:.2f} seconds")
+                
+                print("\n=== TRANSCRIPTION ===")
+                print(results['transcription'][:500] + "..." if len(results['transcription']) > 500 else results['transcription'])
+                
+                print("\n=== AI ANALYSIS ===")
+                print(results['analysis'])
+                
+                # Save results
+                save = input("\nSave results to file? (y/n): ").strip().lower()
+                if save == 'y':
+                    filename = input("Enter filename (default: video_analysis_report.txt): ").strip()
+                    if not filename:
+                        filename = "video_analysis_report.txt"
+                    analyzer.save_analysis_results(results, filename)
+                    print(f"Results saved to {filename}")
+                    
+            except Exception as e:
+                print(f"Error analyzing video: {str(e)}")
+        
+        elif choice == "2":
+            # Process live feed
+            try:
+                camera_idx = input("Enter camera index (default: 0): ").strip()
+                duration = input("Enter duration in seconds (default: 30): ").strip()
+                interval = input("Enter analysis interval in seconds (default: 5): ").strip()
+                
+                camera_idx = int(camera_idx) if camera_idx else 0
+                duration = int(duration) if duration else 30
+                interval = float(interval) if interval else 5.0
+                
+                print(f"Starting live analysis for {duration} seconds...")
+                result = analyzer.process_live_feed(camera_idx, duration, interval)
+                
+                print("\n=== LIVE ANALYSIS SUMMARY ===")
+                print(result)
+                
+            except Exception as e:
+                print(f"Error processing live feed: {str(e)}")
+        
+        elif choice == "3":
+            # Ask question about video
+            if not current_context:
+                print("No video has been analyzed yet. Please analyze a video first.")
+                continue
+            
+            question = input("Enter your question about the video: ").strip()
+            if question:
+                answer = analyzer.ask_question_about_video(question, current_context)
+                print("\n=== ANSWER ===")
+                print(answer)
+            else:
+                print("No question provided.")
+        
+        elif choice == "4":
+            print("Exiting Advanced Video Analysis System. Goodbye!")
+            break
+        
+        else:
+            print("Invalid option. Please try again.")
+
+if __name__ == "__main__":
+    main()
