@@ -89,11 +89,28 @@ class Chatbot:
         print(f"Transcribed: {message}")
         self.chat(message)
 
+
 if __name__ == "__main__":
     chatbot = Chatbot(model)
+    
     while True:
         user_input = input("You: ")
+
         if user_input.lower() in ["quit", "exit", "bye"]:
             print("Goodbye!")
             break
+
+        if user_input.lower().startswith("analyze video"):
+            video_path = user_input.split(" ", 2)[-1]  
+            if not os.path.isfile(video_path):
+                print("File not found!")
+                continue
+
+            summary = analyze_video(video_path)
+            print(f"Video Analysis:\n{summary}")
+            chatbot.speak(summary)
+            continue
+
         chatbot.chat(user_input)
+
+#   analyze_video("myvideo.mp4")

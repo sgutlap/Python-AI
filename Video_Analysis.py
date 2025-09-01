@@ -1,46 +1,55 @@
-# Video_Analysis.py
 import cv2
+import os
+import google.generativeai as genai
 
-def analyze_video(video_path: str):
+# Configure Google GenAI
+genai.configure(api_key="AIzaSyDKnu87M0x5IO7YiIug0p6wl0jWXizBPVc")
+model = genai.GenerativeModel("gemma-3-27b-it")
+
+def extract_keyframes(video_path, max_frames=5):
     """
-    Analyze a video frame by frame. Currently, it only prints frame count,
-    resolution, and duration. You can expand it with AI analysis later.
+    Extracts key frames from a video file.
+    Returns a list of saved image paths.
     """
     cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(total_frames // max_frames, 1)
+    frame_paths = []
 
-    if not cap.isOpened():
-        print(f"Error: Could not open {video_path}")
-        return
+    os.makedirs("frames", exist_ok=True)
+    count = 0
+    frame_idx = 0
 
-    # Get video properties
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    duration = frame_count / fps if fps > 0 else 0
-
-    print(f"Video: {video_path}")
-    print(f"Resolution: {width}x{height}")
-    print(f"FPS: {fps}")
-    print(f"Frame count: {frame_count}")
-    print(f"Duration: {duration:.2f} seconds")
-
-    frame_number = 0
-    while cap.isOpened():
+    while cap.isOpened() and count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Example: display every 60th frame
-        if frame_number % 60 == 0:
-            cv2.imshow("Video Frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        frame_number += 1
-
+        if frame_idx % step == 0:
+            frame_path = f"frames/frame_{count}.jpg"
+            cv2.imwrite(frame_path, frame)
+            frame_paths.append(frame_path)
+            count += 1
+        frame_idx += 1
     cap.release()
-    cv2.destroyAllWindows()
+    return frame_paths
+
+
+def analyze_video(video_path, prompt="Summarize this video content"):
+    """
+    Analyzes a video and returns an AI-generated summary.
+    """
+    print("[INFO] Extracting frames...")
+    frames = extract_keyframes(video_path)
+
+    print("[INFO] Sending frames to AI model...")
+    images = [{"mime_type": "image/jpeg", "data": open(img, "rb").read()} for img in frames]
+
+    request = [{"role": "user", "parts": [{"text": prompt}] + images}]
+    response = model.generate_content(request)
+
+    return response.text
+
 
 if __name__ == "__main__":
-    analyze_video("example.mp4")
+    test_video = "Basketball.mp4"  # Replace with a sample video
+    print(analyze_video(test_video))
