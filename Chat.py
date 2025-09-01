@@ -8,6 +8,7 @@ from gtts import gTTS
 import warnings
 import speech_recognition as sr
 import threading
+from Video_Analysis import analyze_video
 
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -49,7 +50,7 @@ class Chatbot:
         tts.save(speech_file_path)
 
         threading.Thread(target=play_audio, args=(speech_file_path,), daemon=True).start()
-        
+
     def record_audio(self, index=0):
         recorder = PvRecorder(device_index=-1, frame_length=512)
         audio = []
@@ -87,7 +88,6 @@ class Chatbot:
         message = self.transcribe(recorded_filepath)
         print(f"Transcribed: {message}")
         self.chat(message)
-
 
 if __name__ == "__main__":
     chatbot = Chatbot(model)
